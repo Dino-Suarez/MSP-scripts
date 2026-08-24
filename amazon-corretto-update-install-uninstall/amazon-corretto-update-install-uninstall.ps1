@@ -19,7 +19,7 @@ $Global:SavePath = "$($ENV:SystemDrive)\Temp"
 
 # Runtime preferences - these must be configured in the Datto component config
 $RequestedAction = $env:Action              # Selection - Update/Install/Uninstall
-$RequestedVersion = $env:Version            # Selection - 8/11/17/21/22
+$RequestedVersion = $env:Version            # Selection - 8/11/17/21/22/25/26
 $RequestedArchitecture = $env:Architecture  # Selection - x64/x86/x64 and x86
 $RequestedEdition = $env:Edition            # Selection - jdk/jre
 $RequestedRemoveJava = $env:RemoveJava      # Boolean - $true/$false
