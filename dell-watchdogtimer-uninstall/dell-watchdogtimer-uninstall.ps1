@@ -1,17 +1,80 @@
 $appName = 'Dell Watchdog Timer'
 $allowForcedCleanup = $true
-$workDir = "$($ENV:SystemDrive)\temp" # Where to export logs
+$workDir = "$($ENV:SystemDrive)\netxus\temp"
 $issFile = Join-Path $workDir 'DellWDT_uninstall.iss'
 $isLog   = Join-Path $workDir 'DellWDT_uninstall_is.log'
+$driverFile = Join-Path $env:SystemRoot 'System32\drivers\WDTKernel.sys'
+
+$script:rebootPending = $false
 
 $uninstallKeys = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
     'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
 )
 
+# P/Invoke used to schedule deletion of a locked file at next boot
+$moveFileExSig = @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+'@
+
 function Get-WatchdogEntries {
     Get-ItemProperty -Path $uninstallKeys -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName -like "$appName*" }
+}
+
+function Remove-WatchdogDriver {
+    # 1. Find every driver service whose image path is WDTKernel.sys
+    $names = @()
+    $names += Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
+        Where-Object { $_.PathName -like '*WDTKernel.sys*' } |
+        Select-Object -ExpandProperty Name
+    $names += Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction SilentlyContinue |
+        Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ImagePath -like '*WDTKernel.sys*' } |
+        Select-Object -ExpandProperty PSChildName
+    $names = @($names | Where-Object { $_ } | Sort-Object -Unique)
+
+    # 2. Disable, stop and delete each service
+    foreach ($n in $names) {
+        Write-Output "Found driver service: $n"
+        & sc.exe config $n start= disabled | Out-Null   # make sure it can't load again after a reboot
+        & sc.exe stop $n | Out-Null
+
+        $q = ''
+        for ($i = 0; $i -lt 10; $i++) {
+            $q = & sc.exe query $n 2>&1 | Out-String
+            if ($q -match 'STOPPED' -or $q -match '1060') { break }
+            Start-Sleep -Seconds 1
+        }
+        if ($q -match 'RUNNING|STOP_PENDING') {
+            Write-Output "Driver '$n' is still loaded and cannot be unloaded at runtime; a reboot is required."
+            $script:rebootPending = $true
+        }
+
+        Write-Output "Removing driver service: $n"
+        & sc.exe delete $n | Out-Null
+    }
+
+    # 3. Remove the file, or schedule removal at next boot if it is locked
+    if (Test-Path -LiteralPath $driverFile) {
+        Remove-Item -LiteralPath $driverFile -Force -ErrorAction SilentlyContinue
+
+        if (Test-Path -LiteralPath $driverFile) {
+            Write-Output "$driverFile is locked. Scheduling deletion at next reboot."
+            if (-not ('Win32.NativeMethods' -as [type])) {
+                Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition $moveFileExSig
+            }
+            # MOVEFILE_DELAY_UNTIL_REBOOT = 0x4, null destination = delete
+            if ([Win32.NativeMethods]::MoveFileEx($driverFile, $null, 4)) {
+                $script:rebootPending = $true
+            } else {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Output "Failed to schedule deletion (Win32 error $err)."
+            }
+        } else {
+            Write-Output "Removed $driverFile"
+        }
+    }
 }
 
 if ($false -eq (Test-Path $workDir)) {
@@ -20,8 +83,7 @@ if ($false -eq (Test-Path $workDir)) {
 
 $entries = @(Get-WatchdogEntries)
 if ($entries.Count -eq 0) {
-    Write-Output "$appName is not installed. Nothing to do."
-    exit 0
+    Write-Output "$appName is not listed as installed. Skipping uninstall and checking for leftover driver."
 }
 
 foreach ($app in $entries) {
@@ -85,30 +147,19 @@ BootOption=0
     }
 }
 
-# Anything left? Fall back to manual cleanup.
+# Anything left in the installed programs list? Remove the stale entries.
 $remaining = @(Get-WatchdogEntries)
 if ($remaining.Count -gt 0 -and $allowForcedCleanup) {
     Write-Output "Silent uninstall did not remove the entry. Performing manual cleanup."
-
-    Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
-        Where-Object { $_.PathName -like '*WDTKernel.sys*' } |
-        ForEach-Object {
-            Write-Output "Removing driver service: $($_.Name)"
-            Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
-            & sc.exe delete $_.Name | Out-Null
-        }
-
-    $sys = "$env:SystemRoot\System32\drivers\WDTKernel.sys"
-    if (Test-Path $sys) {
-        Remove-Item $sys -Force -ErrorAction SilentlyContinue
-        if (Test-Path $sys) { Write-Output "$sys is locked; it should clear after a reboot." }
-        else { Write-Output "Removed $sys" }
-    }
-
     foreach ($r in $remaining) {
         Remove-Item -Path $r.PSPath -Recurse -Force -ErrorAction SilentlyContinue
         Write-Output "Removed stale uninstall entry $($r.PSChildName)"
     }
+}
+
+# Always check for the driver, whether or not the app was detected
+if ($allowForcedCleanup) {
+    Remove-WatchdogDriver
 }
 
 # Final verification
@@ -120,8 +171,13 @@ if (@(Get-WatchdogEntries).Count -gt 0) {
     Write-Output "$appName is no longer listed."
 }
 
-if (Test-Path "$env:SystemRoot\System32\drivers\WDTKernel.sys") {
-    Write-Output "Note: WDTKernel.sys still exists (may clear after a reboot)."
+if (Test-Path -LiteralPath $driverFile) {
+    if ($script:rebootPending) {
+        Write-Output "WDTKernel.sys is still on disk but is scheduled for deletion. REBOOT REQUIRED to complete removal."
+    } else {
+        Write-Output "WDTKernel.sys still exists and could not be removed or scheduled for removal."
+        $failed = $true
+    }
 } else {
     Write-Output "WDTKernel.sys is not present."
 }
